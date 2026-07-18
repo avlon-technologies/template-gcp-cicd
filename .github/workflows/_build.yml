@@ -1,0 +1,219 @@
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: >
+          Build label to stamp into InformationalVersion. Release, milestone,
+          hotfix, and support callers pass their commit-derived label here.
+          Defaults to YYYYMMDD.run_number when omitted (develop builds and
+          the version-less main rebuild escape hatch).
+        type: string
+        required: false
+        default: ''
+      solution:
+        description: Solution file to restore and build
+        type: string
+        required: false
+        default: 'cicd-demo.sln'
+      push-image:
+        description: >
+          Build and push a container image to Artifact Registry. PR validation
+          leaves this false — it builds and tests but produces nothing
+          deployable. Every deploying caller sets it true.
+        type: boolean
+        required: false
+        default: false
+    outputs:
+      build-label:
+        description: Resolved build label used for assembly version and deployment tag
+        value: ${{ jobs.build.outputs.build-label }}
+      image-digest:
+        description: >
+          Immutable digest (sha256:...) of the pushed image. This is the
+          promotable identity — every downstream deploy references the image
+          by digest, never by tag, so a moved tag cannot change what ships.
+        value: ${{ jobs.build.outputs.image-digest }}
+      image-ref:
+        description: Fully qualified image reference pinned by digest
+        value: ${{ jobs.build.outputs.image-ref }}
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    outputs:
+      build-label: ${{ steps.set-label.outputs.value }}
+      image-digest: ${{ steps.push.outputs.digest }}
+      image-ref: ${{ steps.push.outputs.ref }}
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+      # Required for Workload Identity Federation when pushing an image.
+      # A called workflow cannot exceed its caller's grant — every caller
+      # that passes push-image: true must also grant id-token: write, or the
+      # run fails instantly with startup_failure and no logs.
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set build label
+        id: set-label
+        # Inputs pass via env, never interpolated into the script.
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            echo "value=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=$(date +'%Y%m%d').$RUN_NUMBER" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: '10.x'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore
+        run: dotnet restore ${{ inputs.solution }}
+
+      - name: Build
+        # InformationalVersion must be set at build time — the assembly
+        # attribute is compiled in here; publish below runs with --no-build.
+        # RepositoryUrl becomes assembly metadata (see Api.csproj) that the
+        # app's Swagger description uses for its commit link, so the link
+        # follows the repo wherever it's hosted (forks, renames).
+        env:
+          BUILD_LABEL: ${{ steps.set-label.outputs.value }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: >
+          dotnet build ${{ inputs.solution }}
+          --configuration Release
+          --no-restore
+          /p:InformationalVersion="$BUILD_LABEL"
+          /p:RepositoryUrl="$REPO_URL"
+
+      - name: Test
+        id: test
+        run: >
+          dotnet test Api.Test/Api.Test.csproj
+          --configuration Release
+          --no-build
+          --logger "trx;LogFileName=test-results.trx"
+          --results-directory ./TestResults
+        continue-on-error: true
+
+      - name: Upload test results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: test-results
+          path: ./TestResults/
+          retention-days: 30
+
+      - name: Publish test results
+        uses: EnricoMi/publish-unit-test-result-action@d0a4676d0e0b938bc201470d88276b7c74c712b3 # v2.24.0
+        if: always()
+        with:
+          files: TestResults/*.trx
+
+      - name: Fail if tests failed
+        if: steps.test.outcome == 'failure'
+        run: |
+          echo "::error::Tests failed — see the Test Results check above for details."
+          exit 1
+
+      - name: Publish
+        run: >
+          dotnet publish Api/Api.csproj
+          --configuration Release
+          --no-build
+          --output ./publish
+
+      # ----------------------------------------------------------------------
+      # Container image. Everything below is skipped for PR validation.
+      #
+      # The Dockerfile COPIES ./publish rather than running its own build.
+      # That is deliberate and load-bearing: the binary in the image is the
+      # exact binary the tests above ran against, carrying the
+      # InformationalVersion stamped at build time. A Dockerfile that rebuilt
+      # from source would silently discard both properties, and the smoke
+      # test's version assertion would be checking a different artifact than
+      # the one CI verified.
+      # ----------------------------------------------------------------------
+
+      - name: Authenticate to Google Cloud
+        if: inputs.push-image
+        uses: google-github-actions/auth@140bb5113ffb6b65a7e9b937a81fa96cf5064462 # v2.1.11
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.BUILD_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        if: inputs.push-image
+        uses: google-github-actions/setup-gcloud@6a7c903a70c8625ed6700fa299f5ddb4ca6022e9 # v2.1.5
+
+      - name: Configure Docker for Artifact Registry
+        if: inputs.push-image
+        env:
+          AR_LOCATION: ${{ vars.AR_LOCATION }}
+        run: gcloud auth configure-docker "${AR_LOCATION}-docker.pkg.dev" --quiet
+
+      - name: Build and push image
+        id: push
+        if: inputs.push-image
+        # Two tags are pushed for human legibility (sha-<commit> and the build
+        # label), but neither is the promotable identity — the digest is.
+        # Tags are mutable; a digest is not.
+        env:
+          AR_LOCATION: ${{ vars.AR_LOCATION }}
+          AR_PROJECT_ID: ${{ vars.AR_PROJECT_ID }}
+          AR_REPOSITORY: ${{ vars.AR_REPOSITORY }}
+          IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+          BUILD_LABEL: ${{ steps.set-label.outputs.value }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          IMAGE="${AR_LOCATION}-docker.pkg.dev/${AR_PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}"
+
+          docker buildx build \
+            --file Dockerfile \
+            --tag "${IMAGE}:sha-${COMMIT_SHA}" \
+            --tag "${IMAGE}:${BUILD_LABEL}" \
+            --label "org.opencontainers.image.revision=${COMMIT_SHA}" \
+            --label "org.opencontainers.image.version=${BUILD_LABEL}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --metadata-file /tmp/build-metadata.json \
+            --push \
+            .
+
+          DIGEST="$(jq -r '."containerimage.digest"' /tmp/build-metadata.json)"
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+            echo "::error::Could not read image digest from buildx metadata."
+            exit 1
+          fi
+
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "ref=${IMAGE}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Image pushed"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Label | \`${BUILD_LABEL}\` |"
+            echo "| Digest | \`${DIGEST}\` |"
+            echo "| Reference | \`${IMAGE}@${DIGEST}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

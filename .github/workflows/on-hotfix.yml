@@ -1,0 +1,35 @@
+name: CI/CD — Hotfix → STG
+
+on:
+  push:
+    branches:
+      - hotfix/**
+  # No inputs: the build label is a pure function of the commit (branch name
+  # + commit height) — a dispatch means "deploy this branch's HEAD to stg".
+  workflow_dispatch:
+
+# Dispatches deploy to stg — serialize them with the other stg pipelines
+# (release/support share the group). Pushes only build, so they queue per
+# branch instead of blocking each other across branches.
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && 'deploy-stg' || format('build-{0}', github.ref) }}
+  cancel-in-progress: false
+
+jobs:
+  pipeline:
+    # Union of everything the nested reusable workflows request: _build.yml
+    # needs checks/pull-requests write (test results check), _deploy.yml
+    # needs id-token/contents write. A called workflow cannot exceed its
+    # caller's grant — a missing permission here fails the run instantly with
+    # startup_failure and no logs.
+    permissions:
+      id-token: write
+      contents: write
+      checks: write
+      pull-requests: write
+    uses: ./.github/workflows/_hotfix-support.yml
+    with:
+      branch-type: hotfix
+      event-name: ${{ github.event_name }}
+      ref-name: ${{ github.ref_name }}
+      sha: ${{ github.sha }}

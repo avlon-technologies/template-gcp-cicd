@@ -1,0 +1,375 @@
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: >
+          GitHub environment name (dev | stg | prod). The Cloud Run service
+          name, region, project, and deploy service account come from that
+          environment's variables (SERVICE_NAME, GCP_REGION, GCP_PROJECT_ID,
+          DEPLOY_SERVICE_ACCOUNT) — the job's `environment:` declaration
+          scopes the vars context to it.
+        type: string
+        required: true
+      build-label:
+        description: >
+          Build label (e.g. YYYYMMDD.run_number) shown in the run summary,
+          asserted by the smoke tests, and used for the deployment tag when
+          tag-deployment is set.
+        type: string
+        required: true
+      image-ref:
+        description: >
+          Fully qualified image reference pinned by digest
+          (LOCATION-docker.pkg.dev/PROJECT/REPO/NAME@sha256:...). Promotion
+          passes the digest the stg deploy verified, so prod runs the exact
+          image QA tested. Digests are immutable — unlike the artifact-run-id
+          indirection this replaces, there is no retention window to expire.
+        type: string
+        required: true
+      gated-rollout:
+        description: >
+          Deploy the revision with no traffic, smoke test it on its tagged
+          URL, then shift traffic to it. The Cloud Run equivalent of a
+          blue/green slot swap. Prod sets this; dev and stg deploy directly.
+        type: boolean
+        required: false
+        default: false
+      runner:
+        description: >
+          Runner for this job. Defaults to GitHub-hosted: the Cloud Run admin
+          API is IAM-gated rather than IP-gated, so deploys need no special
+          network position. Point this at a self-hosted runner only when the
+          service uses internal ingress and the post-deploy smoke test cannot
+          otherwise reach it.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+      source-sha:
+        description: >
+          Commit the deployed image was built from. Empty = this run's HEAD.
+          Set on the prod promotion/rollback path so the deployment tag points
+          at the release-branch commit that produced the image, not the merge
+          commit or current main HEAD.
+        type: string
+        required: false
+        default: ''
+      tag-deployment:
+        description: >
+          Tag the deployed commit build/<environment>/<build-label> after a
+          successful deploy. stg/prod callers set this — stg tags are the
+          promotion gate's proof of a green staging deploy and the QA/UAT
+          audit trail; prod tags are the release audit trail. Dev deploys are
+          not tagged (the Deployments view and run history are the record).
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ${{ inputs.runner }}
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@140bb5113ffb6b65a7e9b937a81fa96cf5064462 # v2.1.11
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@6a7c903a70c8625ed6700fa299f5ddb4ca6022e9 # v2.1.5
+
+      - name: Record currently serving revision
+        id: current
+        # Captured BEFORE anything changes, so the rollback step below knows
+        # what to restore. Empty on the very first deploy of a service, which
+        # the rollback step treats as "nothing to roll back to".
+        env:
+          SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          PREV="$(gcloud run services describe "$SERVICE_NAME" \
+            --region "$GCP_REGION" \
+            --project "$GCP_PROJECT_ID" \
+            --format='value(status.traffic.filter("percent:100").revisionName)' \
+            2>/dev/null || true)"
+          echo "revision=${PREV:-}" >> "$GITHUB_OUTPUT"
+          echo "Currently serving: ${PREV:-<none, first deploy>}"
+
+      # ----------------------------------------------------------------------
+      # Direct deploy (dev, stg): the new revision takes traffic immediately.
+      # ----------------------------------------------------------------------
+
+      - name: Deploy revision
+        if: ${{ !inputs.gated-rollout }}
+        env:
+          SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          RUNTIME_SERVICE_ACCOUNT: ${{ vars.RUNTIME_SERVICE_ACCOUNT }}
+          IMAGE_REF: ${{ inputs.image-ref }}
+          BUILD_LABEL: ${{ inputs.build-label }}
+        run: |
+          set -euo pipefail
+          gcloud run deploy "$SERVICE_NAME" \
+            --image "$IMAGE_REF" \
+            --region "$GCP_REGION" \
+            --project "$GCP_PROJECT_ID" \
+            ${RUNTIME_SERVICE_ACCOUNT:+--service-account "$RUNTIME_SERVICE_ACCOUNT"} \
+            --labels "build-label=$(echo "$BUILD_LABEL" | tr '.' '-' | tr '[:upper:]' '[:lower:]')" \
+            --port 8080 \
+            --quiet
+
+      # ----------------------------------------------------------------------
+      # Gated rollout (prod): revision goes up cold, is verified on its own
+      # tagged URL, and only then receives traffic. Cloud Run's equivalent of
+      # deploy-to-slot-then-swap — with the advantage that the candidate gets
+      # a stable preview URL without a second deployment target.
+      # ----------------------------------------------------------------------
+
+      - name: Deploy revision without traffic
+        id: candidate
+        if: ${{ inputs.gated-rollout }}
+        # The Cloud Run tag is derived from the run id, not the build label:
+        # tags must match [a-z0-9-]{1,63} and build labels legitimately
+        # contain dots (1.1.0-build.187).
+        env:
+          SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          RUNTIME_SERVICE_ACCOUNT: ${{ vars.RUNTIME_SERVICE_ACCOUNT }}
+          IMAGE_REF: ${{ inputs.image-ref }}
+          BUILD_LABEL: ${{ inputs.build-label }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          TAG="cand-${RUN_ID}"
+
+          gcloud run deploy "$SERVICE_NAME" \
+            --image "$IMAGE_REF" \
+            --region "$GCP_REGION" \
+            --project "$GCP_PROJECT_ID" \
+            ${RUNTIME_SERVICE_ACCOUNT:+--service-account "$RUNTIME_SERVICE_ACCOUNT"} \
+            --labels "build-label=$(echo "$BUILD_LABEL" | tr '.' '-' | tr '[:upper:]' '[:lower:]')" \
+            --port 8080 \
+            --no-traffic \
+            --tag "$TAG" \
+            --quiet
+
+          REVISION="$(gcloud run services describe "$SERVICE_NAME" \
+            --region "$GCP_REGION" --project "$GCP_PROJECT_ID" \
+            --format='value(status.latestCreatedRevisionName)')"
+
+          TAG_URL="$(gcloud run services describe "$SERVICE_NAME" \
+            --region "$GCP_REGION" --project "$GCP_PROJECT_ID" \
+            --format=json | jq -r --arg t "$TAG" \
+            '.status.traffic[] | select(.tag == $t) | .url')"
+
+          if [ -z "$TAG_URL" ] || [ "$TAG_URL" = "null" ]; then
+            echo "::error::Could not resolve the tagged candidate URL for tag '$TAG'."
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
+          echo "url=$TAG_URL" >> "$GITHUB_OUTPUT"
+          echo "Candidate revision $REVISION is live (no traffic) at $TAG_URL"
+
+      - name: Smoke test candidate revision
+        if: ${{ inputs.gated-rollout }}
+        env:
+          URL: ${{ steps.candidate.outputs.url }}
+          EXPECTED: ${{ inputs.build-label }}
+        run: |
+          # Healthy = answers correctly AND reports the intended build. The
+          # version check treats a mismatch as "not ready" (the old build may
+          # still be serving while the new one warms up) and only fails when
+          # the loop times out. Promoted binaries keep their rc stamp, so the
+          # exact label or a pre-release of it (1.6.0 ← 1.6.0-rc.3) passes.
+          DEPLOYED=""
+          for i in $(seq 1 12); do
+            BODY=$(curl -fsS --max-time 10 "$URL/v1/hello" || true)
+            if [ "$BODY" = "Hello World!" ]; then
+              DEPLOYED=$(curl -fsS --max-time 10 "$URL/openapi/v1.json" | jq -r '.info.version // empty' || true)
+              if [ "$DEPLOYED" = "$EXPECTED" ] || [[ "$DEPLOYED" == "$EXPECTED"-* ]]; then
+                echo "Candidate healthy: $URL is serving build $DEPLOYED"
+                exit 0
+              fi
+              echo "Attempt $i: candidate answering but reports version '${DEPLOYED:-<none>}', want '$EXPECTED'"
+            else
+              echo "Attempt $i: candidate not ready yet"
+            fi
+            sleep 10
+          done
+          echo "::error::Candidate revision failed smoke test (last version seen: '${DEPLOYED:-<none>}', expected '$EXPECTED') — aborting before traffic shift. Production is untouched."
+          exit 1
+
+      - name: Shift traffic to candidate
+        id: shift
+        if: ${{ inputs.gated-rollout }}
+        env:
+          SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REVISION: ${{ steps.candidate.outputs.revision }}
+        run: |
+          set -euo pipefail
+          gcloud run services update-traffic "$SERVICE_NAME" \
+            --region "$GCP_REGION" \
+            --project "$GCP_PROJECT_ID" \
+            --to-revisions "${REVISION}=100" \
+            --quiet
+          echo "100% of traffic now on $REVISION"
+
+      # ----------------------------------------------------------------------
+      # Post-deploy verification, common to both paths.
+      # ----------------------------------------------------------------------
+
+      - name: Resolve service URL
+        id: url
+        env:
+          SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GATEWAY_URL: ${{ vars.GATEWAY_URL }}
+        run: |
+          set -euo pipefail
+          # Through the gateway when the environment defines GATEWAY_URL — a
+          # service behind internal ingress and a load balancer does not admit
+          # callers on its run.app hostname. Otherwise ask Cloud Run for the
+          # service URL rather than constructing it: run.app hostnames include
+          # a generated suffix and are not derivable from the service name.
+          if [ -n "${GATEWAY_URL:-}" ]; then
+            echo "value=$GATEWAY_URL" >> "$GITHUB_OUTPUT"
+          else
+            URL="$(gcloud run services describe "$SERVICE_NAME" \
+              --region "$GCP_REGION" --project "$GCP_PROJECT_ID" \
+              --format='value(status.url)')"
+            echo "value=$URL" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Smoke test deployment
+        env:
+          URL: ${{ steps.url.outputs.value }}
+          EXPECTED: ${{ inputs.build-label }}
+        run: |
+          # Same contract as the candidate smoke test: right answer AND right
+          # build. Catches a traffic shift that silently didn't take effect as
+          # well as a deploy that shipped the wrong image.
+          DEPLOYED=""
+          for i in $(seq 1 12); do
+            BODY=$(curl -fsS --max-time 10 "$URL/v1/hello" || true)
+            if [ "$BODY" = "Hello World!" ]; then
+              DEPLOYED=$(curl -fsS --max-time 10 "$URL/openapi/v1.json" | jq -r '.info.version // empty' || true)
+              if [ "$DEPLOYED" = "$EXPECTED" ] || [[ "$DEPLOYED" == "$EXPECTED"-* ]]; then
+                echo "Deployment healthy: $URL is serving build $DEPLOYED"
+                exit 0
+              fi
+              echo "Attempt $i: app answering but reports version '${DEPLOYED:-<none>}', want '$EXPECTED'"
+            else
+              echo "Attempt $i: app not ready yet"
+            fi
+            sleep 10
+          done
+          echo "::error::Deployment failed smoke test at $URL (last version seen: '${DEPLOYED:-<none>}', expected '$EXPECTED')"
+          exit 1
+
+      - name: Roll traffic back after failed post-shift smoke test
+        # steps.shift.outcome == 'success' means traffic actually moved — a
+        # pre-shift failure (bad build caught on the candidate URL) never took
+        # traffic and must NOT roll back, and a direct deploy has no recorded
+        # predecessor to return to. The job still fails; this only restores
+        # the previously serving revision.
+        if: ${{ failure() && steps.shift.outcome == 'success' && steps.current.outputs.revision != '' }}
+        env:
+          SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          PREV_REVISION: ${{ steps.current.outputs.revision }}
+        run: |
+          echo "::error::Post-shift smoke test failed — returning traffic to $PREV_REVISION."
+          gcloud run services update-traffic "$SERVICE_NAME" \
+            --region "$GCP_REGION" \
+            --project "$GCP_PROJECT_ID" \
+            --to-revisions "${PREV_REVISION}=100" \
+            --quiet
+
+      - name: Remove candidate tag
+        # Always, even on failure: the tag has served its purpose once traffic
+        # is decided either way, and Cloud Run caps the number of tags on a
+        # service. Leaving them to accumulate breaks deploys much later, at a
+        # point where the cause is very hard to see.
+        if: ${{ always() && inputs.gated-rollout && steps.candidate.outputs.tag != '' }}
+        continue-on-error: true
+        env:
+          SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          TAG: ${{ steps.candidate.outputs.tag }}
+        run: |
+          gcloud run services update-traffic "$SERVICE_NAME" \
+            --region "$GCP_REGION" \
+            --project "$GCP_PROJECT_ID" \
+            --remove-tags "$TAG" \
+            --quiet
+
+      - name: Output deployment URL
+        env:
+          URL: ${{ steps.url.outputs.value }}
+          IMAGE_REF: ${{ inputs.image-ref }}
+        run: |
+          echo "Deployed ${{ inputs.build-label }} to ${{ inputs.environment }}: $URL"
+          {
+            echo "### 🚀 Deployed \`${{ inputs.build-label }}\` to **${{ inputs.environment }}**${{ inputs.gated-rollout && ' (gated rollout)' || '' }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| App | $URL |"
+            echo "| Swagger | $URL/swagger |"
+            echo "| API | $URL/v1/hello |"
+            echo "| Image | \`$IMAGE_REF\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tag deployment
+        if: ${{ inputs.tag-deployment }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          # Via env, not interpolated into the script source — a label can't
+          # inject JS even if upstream validation is ever loosened.
+          TAG_REF: refs/tags/build/${{ inputs.environment }}/${{ inputs.build-label }}
+        with:
+          script: |
+            // Tag the commit the image was built from — on the prod
+            // promotion/rollback path that is the release branch head, not
+            // this run's HEAD.
+            const sha = process.env.SOURCE_SHA || context.sha;
+            const tagRef = process.env.TAG_REF;
+            try {
+              await github.rest.git.createRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: tagRef,
+                sha
+              });
+            } catch (err) {
+              if (err.status !== 422) throw err;
+              const existing = await github.rest.git.getRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: tagRef.replace('refs/', '')
+              });
+              if (existing.data.object.sha === sha) {
+                core.info(`Tag already points at ${sha} — nothing to do.`);
+              } else {
+                core.setFailed(`${tagRef} already points at ${existing.data.object.sha} but this deploy is ${sha}. Deployment tags are immutable — use a new label.`);
+              }
+            }

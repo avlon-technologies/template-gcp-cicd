@@ -1,0 +1,48 @@
+name: Show OIDC Token Claims
+
+# Educational: fetches the OIDC JWT that GitHub mints for this job and prints
+# it raw (for jwt.io) plus decoded. The token is requested with a throwaway
+# audience, not the Workload Identity Pool's, so it cannot be exchanged for
+# Google Cloud access even while unexpired.
+#
+# The claim to look at is `sub` — it reads repo:<owner>/<repo>:environment:dev
+# for this job. That exact string is what the WIF provider's attribute
+# condition matches on, which is why each environment gets its own service
+# account and why the prod identity cannot be obtained from a dev job.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  show-token:
+    runs-on: ubuntu-latest
+    # Same environment the real dev deploys use, so the subject claim matches.
+    environment: dev
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Request and decode OIDC token
+        run: |
+          RESPONSE=$(curl -sSL -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=jwt.io-demo")
+          JWT=$(echo "$RESPONSE" | jq -r '.value')
+
+          b64d() { local s="${1//-/+}"; s="${s//_//}"; while [ $((${#s} % 4)) -ne 0 ]; do s="$s="; done; echo "$s" | base64 -d; }
+
+          # GitHub auto-masks OIDC tokens in logs, so the raw token is
+          # uploaded as an artifact instead (see next step).
+          echo "$JWT" > "$RUNNER_TEMP/oidc-jwt.txt"
+
+          echo "=== HEADER (how it's signed) ==="
+          b64d "$(echo "$JWT" | cut -d. -f1)" | jq .
+          echo ""
+          echo "=== CLAIMS (what GitHub asserts about this job) ==="
+          b64d "$(echo "$JWT" | cut -d. -f2)" | jq .
+
+      - name: Upload raw JWT as artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: oidc-jwt
+          path: ${{ runner.temp }}/oidc-jwt.txt
+          retention-days: 1

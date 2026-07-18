@@ -1,0 +1,85 @@
+name: CI/CD — Develop → DEV
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:
+    inputs:
+      build-label:
+        description: 'Build label to redeploy (e.g. 20260703.32). Leave empty to build and deploy HEAD.'
+        required: false
+        type: string
+
+# Serialize dev deploys — rapid pushes to develop must not overlap on the
+# Cloud Run service. Queued runs wait; only the newest queued run is kept.
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate build label
+    runs-on: ubuntu-latest
+    outputs:
+      build-label: ${{ steps.validate.outputs.build-label }}
+    steps:
+      - name: Validate and resolve build label
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_LABEL: ${{ inputs.build-label }}
+        run: |
+          if [ -z "$INPUT_LABEL" ]; then
+            # Push or unspecified dispatch — label resolved by _build.yml at build time.
+            echo "build-label=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Dev deploys are not tagged — validate the label (YYYYMMDD.<run_number>)
+          # against this workflow's own run history instead.
+          if [[ ! "$INPUT_LABEL" =~ ^[0-9]{8}\.[0-9]+$ ]]; then
+            echo "::error::Build label '$INPUT_LABEL' is not in YYYYMMDD.<run_number> format."
+            exit 1
+          fi
+          DAY_RAW="${INPUT_LABEL%%.*}"
+          RUN_NUMBER=$((10#${INPUT_LABEL##*.}))
+          DAY="${DAY_RAW:0:4}-${DAY_RAW:4:2}-${DAY_RAW:6:2}"
+          # Search from the day before too: the run may have been created just
+          # before UTC midnight relative to the build step that stamped the date.
+          if ! FROM=$(date -u -d "$DAY - 1 day" +%F 2>/dev/null); then
+            echo "::error::Build label '$INPUT_LABEL' does not contain a valid date."
+            exit 1
+          fi
+          FOUND=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/on-develop.yml/runs?created=$FROM..$DAY&per_page=100" \
+            --jq "[.workflow_runs[] | select(.run_number == $RUN_NUMBER)] | length")
+          if [ "$FOUND" = "0" ]; then
+            echo "::error::No 'CI/CD — Develop → DEV' run matches label '$INPUT_LABEL'. Check the label against the Actions run history and try again."
+            exit 1
+          fi
+          echo "Run #$RUN_NUMBER on $DAY exists — will rebuild HEAD stamped with label '$INPUT_LABEL'."
+          echo "build-label=$INPUT_LABEL" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+      id-token: write
+    uses: ./.github/workflows/_build.yml
+    with:
+      version: ${{ needs.prepare.outputs.build-label }}
+      push-image: true
+
+  deploy:
+    needs: [prepare, build]
+    permissions:
+      id-token: write
+      contents: write
+    uses: ./.github/workflows/_deploy.yml
+    with:
+      environment: dev
+      build-label: ${{ needs.build.outputs.build-label }}
+      image-ref: ${{ needs.build.outputs.image-ref }}
+      # No tag-deployment: dev deploys are disposable; the Deployments view
+      # and run history are the record.

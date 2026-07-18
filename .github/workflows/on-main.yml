@@ -1,0 +1,333 @@
+name: CI/CD — Main → PROD
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Released version to roll back to (e.g. 1.6.0). See the Releases page.'
+        required: false
+        type: string
+      rebuild-from-source:
+        description: 'Emergency escape hatch: knowingly rebuild main from source and deploy it without stg validation. Ignored when a version is given.'
+        required: false
+        type: boolean
+        default: false
+
+# Serialize prod deploys — overlapping runs would race the traffic shift. Queued
+# runs wait; only the newest queued run is kept (superseded ones are dropped).
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      source-branch: ${{ steps.version.outputs.branch }}
+      promote-ref: ${{ steps.promote.outputs.ref }}
+      promote-sha: ${{ steps.promote.outputs.sha }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Validate dispatch
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        # The dispatch branch dropdown cannot be restricted in the GitHub UI,
+        # and this guard only exists on refs that contain it — the prod
+        # environment's deployment branch policy (main only) is the
+        # enforcement of record. This fails faster, with a better message,
+        # before a build spends minutes.
+        env:
+          REF: ${{ github.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REBUILD: ${{ inputs.rebuild-from-source }}
+        run: |
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::Main → PROD dispatches must run from main (got '${REF#refs/heads/}'). To ship a release, merge its PR into main — the push run promotes the stg-tested image. To roll back, dispatch from main with a released version."
+            exit 1
+          fi
+          if [ -z "$INPUT_VERSION" ] && [ "$REBUILD" != "true" ]; then
+            echo "::error::No version given. Merge the release PR to promote the stg-tested image, pass a released version to roll back, or set rebuild-from-source to knowingly deploy an untested rebuild of main."
+            exit 1
+          fi
+
+      - name: Extract version from merge commit
+        id: version
+        # Push: parse the merge commit subject for a release/hotfix/support
+        # branch name — a subject that doesn't parse is a hard error (see below).
+        # Dispatch with version: use the supplied version directly (rollback path).
+        # Dispatch without version (only reachable with rebuild-from-source —
+        # see Validate dispatch): no version → _build.yml falls back to date label.
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          INPUT_VERSION: ${{ inputs.version }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            # Rollback targets a released version — the v<X.Y.Z> tag and the
+            # API paths below are only meaningful for that exact shape.
+            if [[ ! "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Version '$INPUT_VERSION' is not a released version number (expected X.Y.Z, e.g. 1.5.0 — see the Releases page). Leave the input empty to redeploy current main."
+              exit 1
+            fi
+            echo "value=$INPUT_VERSION" >> $GITHUB_OUTPUT
+            echo "branch=" >> $GITHUB_OUTPUT
+            echo "Rollback dispatch: targeting version $INPUT_VERSION"
+          else
+            BRANCH=$(echo "$COMMIT_MESSAGE" | head -1 | grep -oE '(release|hotfix|support)/[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+            VERSION="${BRANCH#*/}"
+            # main only receives release/hotfix/support merges (ruleset-
+            # enforced), so a push whose subject doesn't name one cannot be
+            # mapped to a stg-tested image. Fail rather than fall through
+            # to a fresh date-labeled rebuild that would ship untested source
+            # to prod. (A version-less rebuild remains available as an
+            # explicit escape hatch: dispatch this workflow from main with
+            # rebuild-from-source set — an empty version alone is refused by
+            # the Validate dispatch step.)
+            if [ "$EVENT" = "push" ] && [ -z "$VERSION" ]; then
+              echo "::error::Could not parse a release/hotfix/support branch from the merge commit subject '$(echo "$COMMIT_MESSAGE" | head -1)'. Refusing to rebuild for prod — the stg-tested image cannot be located without a version. Keep the default merge commit message ('Merge pull request #N from …/release/X.Y.Z'); to redeploy anyway, dispatch this workflow with rebuild-from-source."
+              exit 1
+            fi
+            echo "value=$VERSION" >> $GITHUB_OUTPUT
+            echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+            echo "Resolved version: '${VERSION:-<none, using date label>}' (source branch: '${BRANCH:-<none>}')"
+          fi
+
+      - name: Authenticate to Google Cloud
+        if: steps.version.outputs.value != ''
+        uses: google-github-actions/auth@140bb5113ffb6b65a7e9b937a81fa96cf5064462 # v2.1.11
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.BUILD_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        if: steps.version.outputs.value != ''
+        uses: google-github-actions/setup-gcloud@6a7c903a70c8625ed6700fa299f5ddb4ca6022e9 # v2.1.5
+
+      - name: Locate promotable release image
+        id: promote
+        if: steps.version.outputs.value != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.value }}
+          AR_LOCATION: ${{ vars.AR_LOCATION }}
+          AR_PROJECT_ID: ${{ vars.AR_PROJECT_ID }}
+          AR_REPOSITORY: ${{ vars.AR_REPOSITORY }}
+          IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            # Rollback path: resolve the merge commit SHA from the v<version> release tag,
+            # then walk to its second parent (the release branch head) to find the image.
+            MERGE_SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/v$INPUT_VERSION" \
+              --jq '.sha' 2>/dev/null || true)
+            if [ -z "$MERGE_SHA" ]; then
+              echo "::error::Tag v$INPUT_VERSION not found. Verify the version exists on the Releases page."
+              exit 1
+            fi
+            RELEASE_SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$MERGE_SHA" \
+              --jq '.parents[1].sha // empty')
+          else
+            # Normal push path: the release branch head is the merge commit's second parent.
+            RELEASE_SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA" \
+              --jq '.parents[1].sha // empty')
+          fi
+
+          # A resolved version with no locatable image is a hard error, not a
+          # rebuild: prod ships only binaries staging has tested, and a silent
+          # rebuild here would break that guarantee.
+          if [ -z "$RELEASE_SHA" ]; then
+            echo "::error::v$VERSION does not resolve to a merge commit, so its stg-tested image cannot be located (was the PR squash-merged?). Refusing to rebuild for prod."
+            exit 1
+          fi
+
+          # "Image exists" is not "staging tested it" — the image is pushed at
+          # build time, before the stg deploy. A build/stg/* tag is created
+          # only after a stg deploy passes its smoke test, so require one on
+          # the release commit before promoting.
+          STG_TAG=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/build/stg/" \
+            --jq ".[] | select(.object.sha == \"$RELEASE_SHA\") | .ref" | head -1)
+          if [ -z "$STG_TAG" ]; then
+            echo "::error::No build/stg/* tag points at $RELEASE_SHA — this build was never successfully deployed to staging. Dispatch the release/hotfix/support pipeline on the source branch, verify staging, then re-run this workflow."
+            exit 1
+          fi
+          echo "Staging verified: $STG_TAG points at $RELEASE_SHA."
+
+          IMAGE="${AR_LOCATION}-docker.pkg.dev/${AR_PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}"
+          DIGEST="$(gcloud artifacts docker images list "$IMAGE" \
+            --include-tags \
+            --filter="tags:sha-${RELEASE_SHA}" \
+            --format='value(version)' 2>/dev/null | head -1 || true)"
+
+          if [ -n "$DIGEST" ]; then
+            echo "Promoting ${IMAGE}@${DIGEST} — build will be skipped."
+            echo "ref=${IMAGE}@${DIGEST}" >> "$GITHUB_OUTPUT"
+            echo "sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+          else
+            # Note this is a genuinely different failure mode from the Azure
+            # template's: image digests do not expire, so reaching here means
+            # the image was never built for that commit or a registry cleanup
+            # policy deleted it — not that a retention window lapsed.
+            echo "::error::No image tagged sha-$RELEASE_SHA in $IMAGE — the candidate was never built for v$VERSION, or the image has since been deleted from Artifact Registry. Dispatch the release/hotfix/support pipeline on the source branch (e.g. gh workflow run on-release.yml --ref release/$VERSION), verify staging, then re-run this workflow."
+            exit 1
+          fi
+
+  build:
+    # Skipped when a stg-tested image is being promoted.
+    if: needs.prepare.outputs.promote-ref == ''
+    needs: prepare
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+      id-token: write
+    uses: ./.github/workflows/_build.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      push-image: true
+
+  deploy:
+    needs: [prepare, build]
+    # Run even when build was skipped (promotion path).
+    if: ${{ !failure() && !cancelled() }}
+    # Callers must grant what the reusable workflow's job requests — the repo
+    # default token is read-only and called workflows cannot elevate it.
+    permissions:
+      id-token: write
+      contents: write
+    uses: ./.github/workflows/_deploy.yml
+    with:
+      environment: prod
+      build-label: ${{ needs.prepare.outputs.promote-ref != '' && needs.prepare.outputs.version || needs.build.outputs.build-label }}
+      # Blue/green: revision goes up with no traffic, is smoke tested on its
+      # tagged URL, then takes 100% of traffic.
+      gated-rollout: true
+      image-ref: ${{ needs.prepare.outputs.promote-ref != '' && needs.prepare.outputs.promote-ref || needs.build.outputs.image-ref }}
+      # Tag the release-branch commit the image was built from (empty on the
+      # rebuild path — _deploy.yml then tags this run's HEAD).
+      source-sha: ${{ needs.prepare.outputs.promote-sha }}
+      tag-deployment: true
+
+  release:
+    name: Create GitHub Release
+    # Only when the deploy succeeded and this was a release merge push — not a
+    # manual redeploy/rollback dispatch (release already exists for those versions).
+    if: ${{ !failure() && !cancelled() && needs.prepare.outputs.version != '' && github.event_name == 'push' }}
+    needs: [prepare, deploy]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create release v${{ needs.prepare.outputs.version }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release v$VERSION already exists — skipping."
+          else
+            gh release create "v$VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "v$VERSION" \
+              --generate-notes
+          fi
+
+  backmerge:
+    name: Back-merge to develop
+    # Its own job, parallel to deploy (not downstream of it): the merged
+    # commits are already on main the moment the PR lands, so develop needs
+    # them back regardless of how the prod deploy goes (fix-forward). Only
+    # the deploy job carries the prod environment's approval gate — this job
+    # starts as soon as the merge triggers the run. Push-only: dispatches
+    # redeploy versions whose back-merge already happened.
+    if: ${{ !failure() && !cancelled() && github.event_name == 'push' && needs.prepare.outputs.source-branch != '' }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Open back-merge PR to develop (release)
+        # Bookkeeping only — merging stays a human decision (conflicts with
+        # ongoing develop work are possible). Skips gracefully if the source
+        # branch is already gone or develop already contains it.
+        if: ${{ startsWith(needs.prepare.outputs.source-branch, 'release/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BRANCH: ${{ needs.prepare.outputs.source-branch }}
+        run: |
+          if ! gh api "repos/$GITHUB_REPOSITORY/branches/$BRANCH" > /dev/null 2>&1; then
+            echo "Branch $BRANCH no longer exists — skipping back-merge PR."
+          elif [ -n "$(gh pr list --repo "$GITHUB_REPOSITORY" --base develop --head "$BRANCH" --state open --json number --jq '.[0].number')" ]; then
+            echo "Back-merge PR already open — skipping."
+          else
+            # Only "no commits between" is benign; anything else (e.g. the
+            # "Actions is not permitted to create PRs" repo setting) must
+            # fail loudly instead of masquerading as "nothing to merge".
+            OUTPUT=$(gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base develop \
+              --head "$BRANCH" \
+              --title "Back-merge $BRANCH into develop" \
+              --body "Automated follow-up to merging \`$BRANCH\` into \`main\` (v$VERSION): brings its fixes back into \`develop\`. Merge with a merge commit." \
+              2>&1) && echo "$OUTPUT" || {
+                if echo "$OUTPUT" | grep -q "No commits between"; then
+                  echo "No back-merge needed (develop already contains $BRANCH)."
+                else
+                  echo "::error::Back-merge PR creation failed: $OUTPUT"
+                  exit 1
+                fi
+              }
+          fi
+
+      - name: Checkout for cherry-pick
+        if: ${{ !startsWith(needs.prepare.outputs.source-branch, 'release/') }}
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Cherry-pick fix and open backport PR (hotfix/support)
+        # Hotfix and support branches are cut from main or an old version
+        # tag, never from develop — their history is foreign to develop, so
+        # a branch merge is the wrong shape. Cherry-pick the merge commit's
+        # combined diff (-m 1) onto a branch off develop instead.
+        if: ${{ !startsWith(needs.prepare.outputs.source-branch, 'release/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_BRANCH: ${{ needs.prepare.outputs.source-branch }}
+        run: |
+          BACKPORT="backport/$VERSION"
+          if [ -n "$(gh pr list --repo "$GITHUB_REPOSITORY" --base develop --head "$BACKPORT" --state open --json number --jq '.[0].number')" ]; then
+            echo "Backport PR already open — skipping."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin develop
+          git checkout -B "$BACKPORT" origin/develop
+          if ! git cherry-pick -m 1 "$GITHUB_SHA"; then
+            if [ -z "$(git status --porcelain)" ]; then
+              # Cherry-pick stopped because it produced an empty commit —
+              # develop already contains this change.
+              git cherry-pick --abort 2>/dev/null || true
+              echo "Nothing to backport — develop already contains this change."
+              exit 0
+            fi
+            echo "::error::Cherry-pick of $GITHUB_SHA onto develop hit conflicts. Backport manually: git checkout -b $BACKPORT origin/develop && git cherry-pick -m 1 $GITHUB_SHA — resolve, push, and open a PR to develop."
+            exit 1
+          fi
+          git push -u origin "$BACKPORT"
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base develop \
+            --head "$BACKPORT" \
+            --title "Backport $VERSION to develop" \
+            --body "Automated follow-up to merging \`$SOURCE_BRANCH\` into \`main\` (v$VERSION): cherry-picks the fix onto \`develop\` (hotfix/support branches are cut from \`main\` or old tags, so their history is never merged into \`develop\` directly). Merge with a merge commit."

@@ -1,0 +1,171 @@
+name: Hotfix/Support Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      branch-type:
+        description: hotfix or support
+        type: string
+        required: true
+      event-name:
+        description: github.event_name from the calling workflow
+        type: string
+        required: true
+      ref-name:
+        description: github.ref_name from the calling workflow
+        type: string
+        required: true
+      sha:
+        description: github.sha from the calling workflow
+        type: string
+        required: true
+
+jobs:
+  prepare:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      # When an existing image is reused, its stamped label (from the promote
+      # step) wins over the freshly derived one — the binary is the source of
+      # truth for what it reports.
+      version: ${{ steps.promote.outputs.version || steps.version.outputs.value }}
+      promote-ref: ${{ steps.promote.outputs.ref }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Full history: the label embeds the commit height
+          # (git rev-list --count), which a shallow clone would report as 1.
+          # Treeless partial clone keeps this cheap as history grows — the
+          # count needs commit objects only, no trees or blobs.
+          fetch-depth: 0
+          filter: tree:0
+
+      - name: Derive version from the commit
+        id: version
+        # The label is deterministic — branch name + commit height — so every
+        # build of the same commit produces the same label, and the push
+        # build's artifact is reusable when the deploy is dispatched later.
+        env:
+          REF: ${{ inputs.ref-name }}
+          BRANCH_TYPE: ${{ inputs.branch-type }}
+        run: |
+          # The dispatch form's branch selector defaults to the repo's default
+          # branch (develop) — reject anything that isn't actually a
+          # <branch-type>/* branch before touching version logic, so a
+          # mis-set selector fails fast instead of building/deploying the
+          # wrong ref.
+          if [[ "$REF" != ${BRANCH_TYPE}/* ]]; then
+            echo "::error::This workflow must be run from a $BRANCH_TYPE/* branch, not '$REF'. Check the 'Use workflow from' branch selector on the dispatch form — it defaults to the repository's default branch."
+            exit 1
+          fi
+          BRANCH_VERSION="${REF#${BRANCH_TYPE}/}"
+          SUFFIX=$([[ "$BRANCH_TYPE" == "hotfix" ]] && echo "hotfix" || echo "patch")
+          HEIGHT=$(git rev-list --count HEAD)
+          VALUE="$BRANCH_VERSION-$SUFFIX.$HEIGHT"
+          # Labels become image tags and git tags — restrict to a safe
+          # charset. The auto-generated label inherits the branch name, which
+          # can carry characters those reject.
+          if [[ ! "$VALUE" =~ ^[0-9A-Za-z.-]+$ ]]; then
+            echo "::error::Label '$VALUE' contains unsupported characters (allowed: letters, digits, '.', '-'). Rename the branch."
+            exit 1
+          fi
+          echo "value=$VALUE" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud
+        if: inputs.event-name == 'workflow_dispatch'
+        uses: google-github-actions/auth@140bb5113ffb6b65a7e9b937a81fa96cf5064462 # v2.1.11
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.BUILD_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        if: inputs.event-name == 'workflow_dispatch'
+        uses: google-github-actions/setup-gcloud@6a7c903a70c8625ed6700fa299f5ddb4ca6022e9 # v2.1.5
+
+      - name: Locate existing image
+        id: promote
+        # Same contract as the release pipeline: labels are commit-derived,
+        # so the push build was stamped with the same label this dispatch
+        # resolved — reuse its image, found by its sha-<commit> tag. If the
+        # recovered label disagrees (the derivation changed between push and
+        # dispatch), the existing stamp wins — the version is compiled into
+        # the binary, and re-labeling would ship an app that reports the
+        # wrong version.
+        if: inputs.event-name == 'workflow_dispatch'
+        env:
+          SHA: ${{ inputs.sha }}
+          DERIVED: ${{ steps.version.outputs.value }}
+          AR_LOCATION: ${{ vars.AR_LOCATION }}
+          AR_PROJECT_ID: ${{ vars.AR_PROJECT_ID }}
+          AR_REPOSITORY: ${{ vars.AR_REPOSITORY }}
+          IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          IMAGE="${AR_LOCATION}-docker.pkg.dev/${AR_PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}"
+
+          INFO="$(gcloud artifacts docker images list "$IMAGE" \
+            --include-tags \
+            --filter="tags:sha-${SHA}" \
+            --format=json 2>/dev/null || echo '[]')"
+
+          DIGEST="$(echo "$INFO" | jq -r '.[0].version // empty')"
+          if [ -z "$DIGEST" ]; then
+            echo "No existing image tagged sha-$SHA — will build."
+            exit 0
+          fi
+
+          # tags is an array in current gcloud, a comma-joined string in
+          # older ones — handle both rather than depending on the SDK version
+          # the runner happens to ship.
+          EXISTING_LABEL="$(echo "$INFO" | jq -r '
+            .[0].tags
+            | if type == "array" then .[] else split(",")[] end
+          ' | grep -v '^sha-' | head -1 || true)"
+          if [ -z "$EXISTING_LABEL" ]; then
+            echo "Image for $SHA carries no label tag — rebuilding."
+            exit 0
+          fi
+
+          if [ "$EXISTING_LABEL" != "$DERIVED" ]; then
+            echo "::warning::Existing image is stamped '$EXISTING_LABEL' (derived '$DERIVED' — label derivation changed since the push build). Deploying the binary as what it actually reports."
+            echo "⚠️ **Label drift:** existing image is stamped \`$EXISTING_LABEL\` but the current derivation yields \`$DERIVED\`. Deploying under the stamped label — push a new commit to adopt the new derivation." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "Reusing existing image ${IMAGE}@${DIGEST} (label '$EXISTING_LABEL') — build will be skipped."
+          echo "ref=${IMAGE}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "version=$EXISTING_LABEL" >> "$GITHUB_OUTPUT"
+
+  build:
+    if: needs.prepare.outputs.promote-ref == ''
+    needs: prepare
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+      id-token: write
+    uses: ./.github/workflows/_build.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      # Every build on a hotfix/support branch is promotable: labels are
+      # commit-derived, so the push build already carries the label a later
+      # dispatch will resolve. The image is tagged sha-<commit> for exactly
+      # that lookup.
+      push-image: true
+
+  deploy:
+    if: ${{ !failure() && !cancelled() && inputs.event-name == 'workflow_dispatch' }}
+    needs: [prepare, build]
+    permissions:
+      id-token: write
+      contents: write
+    uses: ./.github/workflows/_deploy.yml
+    with:
+      environment: stg
+      build-label: ${{ needs.prepare.outputs.promote-ref != '' && needs.prepare.outputs.version || needs.build.outputs.build-label }}
+      image-ref: ${{ needs.prepare.outputs.promote-ref != '' && needs.prepare.outputs.promote-ref || needs.build.outputs.image-ref }}
+      # stg tags are the prod promotion gate's proof of a green staging
+      # deploy and the QA/UAT audit trail.
+      tag-deployment: true

@@ -1,0 +1,46 @@
+# Build outputs
+bin/
+obj/
+publish/
+artifacts/
+
+# Test results
+TestResults/
+*.trx
+coverage/
+*.coverage
+*.opencover.xml
+
+# Visual Studio / Rider / VS Code
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+
+# NuGet
+*.nupkg
+packages/
+
+# Local settings and secrets
+appsettings.*.local.json
+*.local.json
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Terraform
+# State contains secrets in plaintext and must never reach a commit; provider
+# binaries bloat the repo. .terraform.lock.hcl is deliberately NOT ignored — it
+# is committed so CI and laptops install byte-identical providers.
+.terraform/
+.terraform.tfstate.lock.info
+*.tfstate
+*.tfstate.*
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json

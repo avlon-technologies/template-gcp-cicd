@@ -1,0 +1,47 @@
+name: PR Validation
+
+# Builds and tests every PR targeting develop or main. The "build / Build &
+# Test" check is required by the branch rulesets before merging.
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+
+# A new push to the PR supersedes the running build — cancel it.
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+      # Granted but unused: PR validation leaves push-image false, so no
+      # image is built and no OIDC token is ever minted. The grant is still
+      # required because a called workflow's permissions block is evaluated
+      # at job start, before any step condition — and a called workflow
+      # cannot exceed its caller's grant.
+      id-token: write
+    uses: ./.github/workflows/_build.yml
+
+  guard-main-source:
+    name: Guard main source branch
+    # main receives code only through release/* or hotfix/* branches — features
+    # flow via develop and reach prod through a release. Required check on main.
+    if: github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce release, hotfix, or support source
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [[ "$HEAD_REF" == release/* || "$HEAD_REF" == hotfix/* || "$HEAD_REF" == support/* ]]; then
+            echo "Source branch '$HEAD_REF' is allowed into main."
+          else
+            echo "::error::PRs into main must come from a release/*, hotfix/*, or support/* branch, not '$HEAD_REF'. Merge to develop and cut a release instead."
+            exit 1
+          fi

@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <ItemGroup>
+    <!-- CI passes /p:RepositoryUrl=<server>/<owner>/<repo>; Program.cs reads
+         this attribute for the Swagger commit link. Local builds don't set
+         the property, so the attribute (and the link) is simply absent. -->
+    <AssemblyMetadata Include="RepositoryUrl" Value="$(RepositoryUrl)" Condition="'$(RepositoryUrl)' != ''" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Asp.Versioning.Http" Version="10.0.0" />
+    <PackageReference Include="Asp.Versioning.Mvc.ApiExplorer" Version="10.0.0" />
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.9" />
+    <!-- Explicit override: Microsoft.AspNetCore.OpenApi transitively pulls
+         Microsoft.OpenApi 2.0.0, which has a known vulnerability (NU1903,
+         GHSA-v5pm-xwqc-g5wc; patched in 2.7.5). Drop when the transitive
+         version catches up. -->
+    <PackageReference Include="Microsoft.OpenApi" Version="2.10.0" />
+    <PackageReference Include="Swashbuckle.AspNetCore.SwaggerUI" Version="10.2.3" />
+  </ItemGroup>
+</Project>
