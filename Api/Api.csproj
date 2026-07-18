@@ -8,7 +8,7 @@
   <ItemGroup>
     <PackageReference Include="Asp.Versioning.Http" Version="10.0.0" />
     <PackageReference Include="Asp.Versioning.Mvc.ApiExplorer" Version="10.0.0" />
-    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.9" />
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.10" />
     <!-- Explicit override: Microsoft.AspNetCore.OpenApi transitively pulls
          Microsoft.OpenApi 2.0.0, which has a known vulnerability (NU1903,
          GHSA-v5pm-xwqc-g5wc; patched in 2.7.5). Drop when the transitive
