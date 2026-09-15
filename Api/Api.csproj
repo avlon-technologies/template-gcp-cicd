@@ -13,7 +13,7 @@
          Microsoft.OpenApi 2.0.0, which has a known vulnerability (NU1903,
          GHSA-v5pm-xwqc-g5wc; patched in 2.7.5). Drop when the transitive
          version catches up. -->
-    <PackageReference Include="Microsoft.OpenApi" Version="2.10.0" />
+    <PackageReference Include="Microsoft.OpenApi" Version="3.9.0" />
     <PackageReference Include="Swashbuckle.AspNetCore.SwaggerUI" Version="10.2.3" />
   </ItemGroup>
 </Project>
